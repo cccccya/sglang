@@ -1,89 +1,185 @@
 import asyncio
 import logging
+import math
 import threading
 import time
+from dataclasses import dataclass
+from enum import Enum, auto
 from queue import Empty, Queue
-from typing import List, Optional
+from typing import List, Optional, Tuple
 
 import torch
 
+from sglang.srt.managers.schedule_batch import Modality
 from sglang.srt.mem_cache.storage.mooncake_store.mooncake_embedding_store import (
     MooncakeEmbeddingStore,
 )
 
 logger = logging.getLogger(__name__)
 
+TARGET_PAGE_BYTES = 256 * 1024
+VISION_POOL_RATIO = 0.8
 
-class ContiguousMemoryAllocator:
-    """
-    A simple allocator to manage variable-sized contiguous blocks
-    within a large pre-allocated flat buffer.
-    """
 
-    def __init__(self, total_size_bytes: int):
-        self.total_size = total_size_bytes
-        # List of (offset, size) for free blocks
-        self.free_blocks = [(0, total_size_bytes)]
-        self.allocated_map = {}  # {offset: size_bytes}
-        self.allocated_size = 0  # Running counter for O(1) get_allocated_size
-        self.lock = threading.Lock()
+def _dtype_element_size(dtype: torch.dtype) -> int:
+    return torch.tensor([], dtype=dtype).element_size()
 
-    def allocate(self, size_bytes: int) -> Optional[int]:
-        with self.lock:
-            # Simple First-Fit allocation
-            for i, (offset, block_size) in enumerate(self.free_blocks):
-                if block_size >= size_bytes:
-                    # Allocate from this block
-                    remaining_size = block_size - size_bytes
-                    if remaining_size > 0:
-                        self.free_blocks[i] = (offset + size_bytes, remaining_size)
-                    else:
-                        self.free_blocks.pop(i)
-                    self.allocated_map[offset] = size_bytes
-                    self.allocated_size += size_bytes
-                    return offset
+
+def compute_page_size_tokens(dim: int, element_size: int = 4) -> int:
+    return max(TARGET_PAGE_BYTES // (dim * element_size), 1)
+
+
+class EntryState(Enum):
+    LOADING = auto()
+    EVICTABLE = auto()
+    PUTTING = auto()
+
+
+class TokenPageAllocator:
+    """LIFO page allocator for fixed-size token pages."""
+
+    def __init__(self, num_pages: int):
+        self.free_list: List[int] = list(reversed(range(num_pages)))
+
+    def allocate(self, num_tokens: int, page_size_tokens: int) -> Optional[List[int]]:
+        required_pages = math.ceil(num_tokens / page_size_tokens)
+        if len(self.free_list) < required_pages:
             return None
+        return [self.free_list.pop() for _ in range(required_pages)]
 
-    def free(self, offset: int, size_bytes: int):
-        with self.lock:
-            # Remove from allocated map and update counter
-            if offset in self.allocated_map:
-                self.allocated_size -= self.allocated_map[offset]
-                del self.allocated_map[offset]
+    def free(self, page_ids: List[int]):
+        self.free_list.extend(reversed(page_ids))
 
-            # Return block and merge adjacent free blocks
-            self.free_blocks.append((offset, size_bytes))
-            self.free_blocks.sort()
+    @property
+    def free_pages(self) -> int:
+        return len(self.free_list)
 
-            merged = []
-            if not self.free_blocks:
-                return
 
-            curr_offset, curr_size = self.free_blocks[0]
-            for next_offset, next_size in self.free_blocks[1:]:
-                if curr_offset + curr_size == next_offset:
-                    curr_size += next_size
-                else:
-                    merged.append((curr_offset, curr_size))
-                    curr_offset, curr_size = next_offset, next_size
-            merged.append((curr_offset, curr_size))
-            self.free_blocks = merged
+@dataclass
+class EmbeddingPool:
+    modality: str
+    dim: int
+    dtype: torch.dtype
+    page_size_tokens: int
+    tensor: torch.Tensor
+    num_pages: int
+    allocator: TokenPageAllocator
+    page_bytes: int
+    pool_size_bytes: int
+    pin_memory: bool = True
 
-    def get_allocated_size(self) -> int:
-        """Return total allocated bytes. O(1) operation."""
-        with self.lock:
-            return self.allocated_size
+    @classmethod
+    def create(
+        cls,
+        modality: str,
+        dim: int,
+        pool_size_bytes: int,
+        dtype: torch.dtype = torch.float32,
+        pin_memory: bool = True,
+    ) -> "EmbeddingPool":
+        element_size = _dtype_element_size(dtype)
+        page_size_tokens = compute_page_size_tokens(dim, element_size)
+        capacity_tokens = pool_size_bytes // (dim * element_size)
+        num_pages = capacity_tokens // page_size_tokens
+        total_tokens = num_pages * page_size_tokens
+        tensor = torch.empty(
+            (total_tokens, dim),
+            dtype=dtype,
+            pin_memory=pin_memory,
+        )
+        page_bytes = page_size_tokens * dim * element_size
+        return cls(
+            modality=modality,
+            dim=dim,
+            dtype=dtype,
+            page_size_tokens=page_size_tokens,
+            tensor=tensor,
+            num_pages=num_pages,
+            allocator=TokenPageAllocator(num_pages),
+            page_bytes=page_bytes,
+            pool_size_bytes=pool_size_bytes,
+            pin_memory=pin_memory,
+        )
 
-    def get_free_size(self) -> int:
-        """Return total free bytes."""
-        with self.lock:
-            return sum(block_size for _, block_size in self.free_blocks)
+    def reinit(self, new_dim: int):
+        fresh = EmbeddingPool.create(
+            self.modality,
+            new_dim,
+            self.pool_size_bytes,
+            dtype=self.dtype,
+            pin_memory=self.pin_memory,
+        )
+        self.dim = fresh.dim
+        self.page_size_tokens = fresh.page_size_tokens
+        self.page_bytes = fresh.page_bytes
+        self.tensor = fresh.tensor
+        self.num_pages = fresh.num_pages
+        self.allocator = fresh.allocator
+
+
+@dataclass
+class EmbeddingCacheEntry:
+    hash: str
+    modality: object
+    num_tokens: int
+    dim: int
+    page_ids: List[int]
+    state: EntryState
+    ref_count: int = 0
+
+
+def build_transfer_buffers(
+    entry: EmbeddingCacheEntry, pool: EmbeddingPool
+) -> Tuple[List[int], List[int]]:
+    """Coalesce physically adjacent pages while preserving logical page order.
+
+    Returns:
+        (ptrs, sizes) - two parallel lists of buffer pointers and byte sizes.
+    """
+    if not entry.page_ids:
+        return [], []
+
+    ptrs: List[int] = []
+    sizes: List[int] = []
+    remaining_tokens = entry.num_tokens
+    element_size = _dtype_element_size(pool.dtype)
+
+    def flush(run_start: int, run_len: int):
+        nonlocal remaining_tokens
+        if remaining_tokens <= 0:
+            return
+        valid_tokens = min(pool.page_size_tokens * run_len, remaining_tokens)
+        ptr = pool.tensor[run_start * pool.page_size_tokens].data_ptr()
+        size_bytes = valid_tokens * entry.dim * element_size
+        ptrs.append(ptr)
+        sizes.append(size_bytes)
+        remaining_tokens -= valid_tokens
+
+    run_start = entry.page_ids[0]
+    prev = run_start
+    run_len = 1
+    for page_id in entry.page_ids[1:]:
+        if page_id == prev + 1:
+            run_len += 1
+        else:
+            flush(run_start, run_len)
+            run_start = page_id
+            run_len = 1
+        prev = page_id
+    flush(run_start, run_len)
+    return ptrs, sizes
 
 
 class EmbeddingPrefetchOperation:
     """Groups all missing images of a request for a single batch GET."""
 
-    def __init__(self, req_id: str, keys: List[str], ptrs: List[int], sizes: List[int]):
+    def __init__(
+        self,
+        req_id: str,
+        keys: List[str],
+        ptrs: List[List[int]],
+        sizes: List[List[int]],
+    ):
         self.req_id = req_id
         self.keys = keys
         self.ptrs = ptrs
@@ -101,7 +197,7 @@ class EmbeddingPrefetchOperation:
 class EmbeddingInsertOperation:
     """Groups all newly computed images of a request for a single batch PUT."""
 
-    def __init__(self, keys: List[str], ptrs: List[int], sizes: List[int]):
+    def __init__(self, keys: List[str], ptrs: List[List[int]], sizes: List[List[int]]):
         self.keys = keys
         self.ptrs = ptrs
         self.sizes = sizes
@@ -124,37 +220,26 @@ class EmbeddingCacheController:
         self.tp_rank = tp_rank
         self.all_rank_get = all_rank_get
         self.hidden_dims = hidden_dims or {}
-        self.element_size = torch.float32.itemsize
+        self.dtype = torch.float32
+        self.element_size = _dtype_element_size(self.dtype)
         self.enable_eviction = enable_eviction
         self.max_eviction_batch = max_eviction_batch
 
-        # 1. Mooncake Backend & Pinned Buffer
         self.mooncake_store = MooncakeEmbeddingStore()
         self.total_pool_size_bytes = int(max_pool_size_gb * 1024**3)
-        self.cpu_pool = torch.empty(
-            self.total_pool_size_bytes, dtype=torch.uint8, pin_memory=True
-        )
-        self.mooncake_store.register_buffer(self.cpu_pool)
+        self.vision_pool, self.audio_pool = self._create_pools(pin_memory=True)
+        self.pools = {
+            "vision": self.vision_pool,
+            "audio": self.audio_pool,
+        }
+        self._retired_pool_tensors = []
+        self._register_pool_buffer(self.vision_pool)
+        self._register_pool_buffer(self.audio_pool)
 
-        # 2. Variable Size Memory Management
-        self.allocator = ContiguousMemoryAllocator(self.total_pool_size_bytes)
-        # {hash: (offset, num_tokens, embedding_dim, size_bytes, last_access_time)}
-        self.hash_to_metadata = {}
-
-        # 3. LRU Tracking
-        # OrderedDict maintains insertion order, used as LRU cache
-        # hash -> access_time
+        self.entries = {}
         self.access_order = {}
         self.access_lock = threading.Lock()
 
-        # 4. RDMA / read reference counting
-        # {hash: ref_count} — entries with ref_count > 0 cannot be evicted.
-        # Incremented when an RDMA transfer (GET/PUT) is in flight or when
-        # get_embeddings() returns a view into cpu_pool.  Decremented after
-        # the RDMA completes or the caller releases the view.
-        self.ref_counts = {}
-
-        # 5. Statistics
         self.stats = {
             "total_allocated": 0,
             "total_evicted": 0,
@@ -162,8 +247,7 @@ class EmbeddingCacheController:
             "allocation_failures": 0,
         }
 
-        # 6. Task Tracking
-        self.ongoing_prefetch = {}  # {req_id: EmbeddingPrefetchOperation}
+        self.ongoing_prefetch = {}
         self.prefetch_queue = Queue()
         self.insert_queue = Queue()
 
@@ -186,6 +270,47 @@ class EmbeddingCacheController:
         else:
             self.prefetch_tp_group = None
 
+    def _create_pools(self, pin_memory: bool) -> Tuple[EmbeddingPool, EmbeddingPool]:
+        # vision pool uses IMAGE dim (IMAGE == VIDEO dim in all supported models)
+        vision_dim = (
+            self.hidden_dims.get(Modality.IMAGE)
+            or self.hidden_dims.get(Modality.VIDEO)
+            or 1
+        )
+        audio_dim = self.hidden_dims.get(Modality.AUDIO) or vision_dim
+        vision_bytes = int(self.total_pool_size_bytes * VISION_POOL_RATIO)
+        audio_bytes = self.total_pool_size_bytes - vision_bytes
+        return (
+            EmbeddingPool.create(
+                "vision", vision_dim, vision_bytes, self.dtype, pin_memory
+            ),
+            EmbeddingPool.create(
+                "audio", audio_dim, audio_bytes, self.dtype, pin_memory
+            ),
+        )
+
+    def _register_pool_buffer(self, pool: EmbeddingPool):
+        if pool.tensor.numel() == 0:
+            logger.warning(
+                f"[Rank {self.tp_rank}] {pool.modality} embedding pool has zero pages; "
+                f"dim={pool.dim}, budget={pool.pool_size_bytes} bytes"
+            )
+            return
+        self.mooncake_store.register_buffer(pool.tensor)
+        logger.info(
+            f"[Rank {self.tp_rank}] Registered {pool.modality} embedding pool: "
+            f"dim={pool.dim}, pages={pool.num_pages}, "
+            f"page_tokens={pool.page_size_tokens}, "
+            f"capacity={pool.num_pages * pool.page_bytes / 1024**2:.2f} MB"
+        )
+
+    def _get_pool(self, modality: Modality) -> Optional[EmbeddingPool]:
+        if modality == Modality.AUDIO:
+            return self.audio_pool
+        if modality in (Modality.IMAGE, Modality.VIDEO):
+            return self.vision_pool
+        return None
+
     def _update_access_time(self, image_hash: str):
         """Update LRU access time for a hash."""
         with self.access_lock:
@@ -194,147 +319,160 @@ class EmbeddingCacheController:
                 del self.access_order[image_hash]
             self.access_order[image_hash] = time.time()
 
-    def _protect_hash(self, image_hash: str):
-        """Increment ref count to prevent eviction during RDMA or active read.
+    def _evict_entry(self, image_hash: str):
+        """Evict a single entry and free its pages.
 
         NOTE: Caller must hold self.lock.
         """
-        self.ref_counts[image_hash] = self.ref_counts.get(image_hash, 0) + 1
-
-    def _release_hash(self, image_hash: str):
-        """Decrement ref count after RDMA completes or caller releases a view.
-
-        NOTE: Caller must hold self.lock.
-        """
-        if image_hash in self.ref_counts:
-            self.ref_counts[image_hash] -= 1
-            if self.ref_counts[image_hash] <= 0:
-                del self.ref_counts[image_hash]
-
-    def _select_eviction_candidates(self, required_bytes: int) -> List[str]:
-        """Select LRU candidates to free up at least required_bytes.
-
-        NOTE: Caller must hold self.lock before calling this method.
-        """
-        candidates = []
-        freed_bytes = 0
-
+        entry = self.entries.get(image_hash)
+        if entry is None:
+            return
+        pool = self._get_pool(entry.modality)
+        pool.allocator.free(entry.page_ids)
+        self.stats["total_evicted"] += entry.num_tokens * entry.dim * self.element_size
+        del self.entries[image_hash]
         with self.access_lock:
-            # Sort by access time (oldest first)
-            # Python dicts are insertion-ordered; the first keys are the oldest.
-            sorted_hashes = list(self.access_order.items())
+            self.access_order.pop(image_hash, None)
 
-        for image_hash, _ in sorted_hashes:
-            if image_hash not in self.hash_to_metadata:
+    def _evict_for_pool(self, pool: EmbeddingPool, required_pages: int):
+        """Evict LRU entries until pool has at least required_pages free.
+
+        NOTE: Caller must hold self.lock.
+        """
+        if pool.allocator.free_pages >= required_pages:
+            return
+        with self.access_lock:
+            lru_hashes = list(self.access_order.keys())
+        evicted = 0
+        for image_hash in lru_hashes:
+            if pool.allocator.free_pages >= required_pages:
+                break
+            if evicted >= self.max_eviction_batch:
+                break
+            entry = self.entries.get(image_hash)
+            if entry is None:
                 with self.access_lock:
                     self.access_order.pop(image_hash, None)
                 continue
-            if self.ref_counts.get(image_hash, 0) > 0:
+            if self._get_pool(entry.modality) is not pool:
                 continue
-            metadata = self.hash_to_metadata[image_hash]
-            size_bytes = metadata[3] if len(metadata) > 3 else 0
-            candidates.append(image_hash)
-            freed_bytes += size_bytes
+            if entry.state in (EntryState.LOADING, EntryState.PUTTING):
+                continue
+            if entry.ref_count > 0:
+                continue
+            self._evict_entry(image_hash)
+            evicted += 1
+        if evicted > 0:
+            self.stats["eviction_count"] += 1
+            logger.info(
+                f"[Rank {self.tp_rank}] Evicted {evicted} embeddings from "
+                f"{pool.modality} pool"
+            )
 
-            if freed_bytes >= required_bytes:
-                break
+    def _allocate_with_eviction(
+        self, pool: EmbeddingPool, num_tokens: int
+    ) -> Optional[List[int]]:
+        """Allocate pages, evicting LRU entries from the same pool if needed.
 
-            if len(candidates) >= self.max_eviction_batch:
-                break
-
-        return candidates
-
-    def _evict_hashes(self, hashes_to_evict: List[str]) -> int:
-        """Evict specified hashes and free their memory. Returns freed bytes.
-
-        NOTE: Caller must hold self.lock before calling this method.
+        NOTE: Caller must hold self.lock.
         """
-        total_freed = 0
+        required_pages = math.ceil(num_tokens / pool.page_size_tokens)
+        if required_pages > pool.num_pages:
+            self.stats["allocation_failures"] += 1
+            return None
 
-        # NOTE: self.lock should be held by the caller (e.g., insert_batch,
-        # prefetch). Do NOT acquire it here to avoid reentrant deadlock.
-        for image_hash in hashes_to_evict:
-            if image_hash not in self.hash_to_metadata:
+        if self.enable_eviction:
+            self._evict_for_pool(pool, required_pages)
+
+        page_ids = pool.allocator.allocate(num_tokens, pool.page_size_tokens)
+        if page_ids is not None:
+            self.stats["total_allocated"] += num_tokens * pool.dim * self.element_size
+        else:
+            self.stats["allocation_failures"] += 1
+            logger.warning(
+                f"[Rank {self.tp_rank}] Cannot allocate {required_pages} pages "
+                f"in {pool.modality} pool: free={pool.allocator.free_pages}"
+            )
+        return page_ids
+
+    # TODO(cya): check how to reinit pool
+    def _drop_pool_entries(self, pool: EmbeddingPool):
+        for image_hash, entry in list(self.entries.items()):
+            if self._get_pool(entry.modality) is not pool:
                 continue
-
-            # Safety check: skip entries with in-flight RDMA or active reads
-            if self.ref_counts.get(image_hash, 0) > 0:
-                logger.warning(
-                    f"[Rank {self.tp_rank}] Skipping eviction of {image_hash}: "
-                    f"ref_count={self.ref_counts[image_hash]} (in-flight RDMA or active read)"
-                )
-                continue
-
-            offset, num_tokens, dim, size_bytes = self.hash_to_metadata[image_hash][:4]
-
-            # Free memory in allocator
-            self.allocator.free(offset, size_bytes)
-
-            # Remove from metadata and ref counts
-            del self.hash_to_metadata[image_hash]
-            self.ref_counts.pop(image_hash, None)
-
-            # Remove from access order
+            del self.entries[image_hash]
             with self.access_lock:
                 self.access_order.pop(image_hash, None)
 
-            total_freed += size_bytes
-            self.stats["total_evicted"] += size_bytes
-
-        if total_freed > 0:
-            self.stats["eviction_count"] += 1
-
-        if total_freed > 0:
-            logger.info(
-                f"[Rank {self.tp_rank}] Evicted {len(hashes_to_evict)} embeddings, "
-                f"freed {total_freed / 1024**2:.2f} MB"
-            )
-
-        return total_freed
-
-    def _allocate_with_eviction(self, size_bytes: int) -> Optional[int]:
-        """Try to allocate memory, evicting old entries if necessary."""
-        # First try direct allocation
-        offset = self.allocator.allocate(size_bytes)
-        if offset is not None:
-            self.stats["total_allocated"] += size_bytes
-            return offset
-
-        # If failed and eviction is enabled, try eviction
-        if not self.enable_eviction:
-            self.stats["allocation_failures"] += 1
-            return None
-
-        # Select candidates to evict
-        candidates = self._select_eviction_candidates(size_bytes)
-        if not candidates:
-            n_protected = sum(1 for v in self.ref_counts.values() if v > 0)
+    def _reinit_pool_for_dim(self, pool: EmbeddingPool, actual_dim: int) -> bool:
+        active = [
+            entry.hash
+            for entry in self.entries.values()
+            if self._get_pool(entry.modality) is pool
+            and (entry.ref_count > 0 or entry.state != EntryState.EVICTABLE)
+        ]
+        if active:
             logger.warning(
-                f"[Rank {self.tp_rank}] Cannot allocate {size_bytes / 1024**2:.2f} MB: "
-                f"pool full ({self.allocator.get_allocated_size() / 1024**2:.1f}/"
-                f"{self.total_pool_size_bytes / 1024**2:.1f} MB used), "
-                f"no evictable candidates "
-                f"({len(self.hash_to_metadata)} entries, {n_protected} protected)"
+                f"[Rank {self.tp_rank}] Cannot reinitialize {pool.modality} pool "
+                f"for dim={actual_dim}; active entries={len(active)}"
             )
-            self.stats["allocation_failures"] += 1
-            return None
+            return False
 
-        # Evict and try again
-        freed = self._evict_hashes(candidates)
-        if freed < size_bytes:
-            logger.warning(
-                f"[Rank {self.tp_rank}] Could not free enough memory: "
-                f"needed {size_bytes / 1024**2:.2f} MB, freed {freed / 1024**2:.2f} MB"
+        logger.warning(
+            f"[Rank {self.tp_rank}] Reinitializing {pool.modality} embedding pool: "
+            f"expected dim={pool.dim}, actual dim={actual_dim}"
+        )
+        self._drop_pool_entries(pool)
+        if not hasattr(self, "_retired_pool_tensors"):
+            self._retired_pool_tensors = []
+        self._retired_pool_tensors.append(pool.tensor)
+        pool.reinit(actual_dim)
+        self._register_pool_buffer(pool)
+        return True
+
+    # TODO(cya): change to hicahe copy
+    def _copy_tensor_to_pages(
+        self, tensor: torch.Tensor, entry: EmbeddingCacheEntry, pool: EmbeddingPool
+    ):
+        src = tensor.detach()
+        if src.ndim != 2:
+            src = src.reshape(-1, src.shape[-1])
+        if src.device.type != "cpu":
+            src = src.cpu()
+        if not src.is_contiguous():
+            src = src.contiguous()
+
+        copied = 0
+        for page_id in entry.page_ids:
+            valid_tokens = min(pool.page_size_tokens, entry.num_tokens - copied)
+            if valid_tokens <= 0:
+                break
+            start = page_id * pool.page_size_tokens
+            pool.tensor[start : start + valid_tokens].copy_(
+                src[copied : copied + valid_tokens]
             )
+            copied += valid_tokens
 
-        # Try allocation again after eviction
-        offset = self.allocator.allocate(size_bytes)
-        if offset is not None:
-            self.stats["total_allocated"] += size_bytes
-        else:
-            self.stats["allocation_failures"] += 1
-
-        return offset
+    def _copy_entry_to_tensor(
+        self,
+        entry: EmbeddingCacheEntry,
+        dst_tensor: torch.Tensor,
+        dst_token_offset: int,
+    ):
+        pool = self._get_pool(entry.modality)
+        copied = 0
+        non_blocking = dst_tensor.device.type == "cuda"
+        for page_id in entry.page_ids:
+            valid_tokens = min(pool.page_size_tokens, entry.num_tokens - copied)
+            if valid_tokens <= 0:
+                break
+            src_start = page_id * pool.page_size_tokens
+            dst_start = dst_token_offset + copied
+            dst_tensor[dst_start : dst_start + valid_tokens].copy_(
+                pool.tensor[src_start : src_start + valid_tokens],
+                non_blocking=non_blocking,
+            )
+            copied += valid_tokens
 
     def prefetch(
         self,
@@ -343,54 +481,70 @@ class EmbeddingCacheController:
         expected_tokens: List[int],
         modality=None,
     ):
-        """Issues ONE batch GET for all missing images in the request."""
-        dim = self.hidden_dims.get(modality) if modality is not None else None
-        if not dim:
-            logger.warning(
-                f"Req {req_id}: Unknown dim for modality={modality}, skipping prefetch (will fallback to ViT)."
-            )
+        """Issues ONE batch GET for cache-hit embeddings that are not local yet."""
+        pool = self._get_pool(modality)
+        if pool is None:
+            logger.warning(f"insert_batch: unknown modality {modality}; skipping.")
             return
-        keys, ptrs, sizes = [], [], []
+
+        keys, all_ptrs, all_sizes = [], [], []
 
         with self.lock:
-            for h, num_tokens in zip(image_hashes, expected_tokens):
-                if h in self.hash_to_metadata:
-                    # Update access time for LRU
-                    self._update_access_time(h)
-                    logger.debug(
-                        f"Req {req_id}: Hash already in local metadata, skipping prefetch."
-                    )
+            # TODO(cya): check raw_hash, 保留还是让调用方都转str
+            for image_hash, num_tokens in zip(image_hashes, expected_tokens):
+                entry = self.entries.get(image_hash)
+                if entry is not None:
+                    if entry.state in (EntryState.EVICTABLE, EntryState.PUTTING):
+                        self._update_access_time(image_hash)
+                    # TODO(cya): check how to deal with LOADING entry
+                    else:
+                        logger.debug(
+                            f"Req {req_id}: {image_hash} is already LOADING; "
+                            f"treating as miss."
+                        )
                     continue
 
-                size_bytes = num_tokens * dim * self.element_size
-                offset = self._allocate_with_eviction(size_bytes)
-                if offset is None:
+                page_ids = self._allocate_with_eviction(pool, int(num_tokens))
+                if page_ids is None:
                     logger.warning(
-                        f"Req {req_id}: Failed to allocate {size_bytes / 1024**2:.2f} MB "
-                        f"for prefetch, skipping this image."
+                        f"Req {req_id}: Failed to allocate {num_tokens} tokens "
+                        f"in {pool.modality} pool; falling back to encoder."
                     )
                     continue
 
-                self.hash_to_metadata[h] = (offset, num_tokens, dim, size_bytes)
-                self._update_access_time(h)
-                self._protect_hash(h)
-                keys.append(h)
-                ptrs.append(self.cpu_pool.data_ptr() + offset)
-                sizes.append(size_bytes)
+                entry = EmbeddingCacheEntry(
+                    hash=image_hash,
+                    modality=modality,
+                    num_tokens=int(num_tokens),
+                    dim=pool.dim,
+                    page_ids=page_ids,
+                    state=EntryState.LOADING,
+                    ref_count=0,
+                )
+                self.entries[image_hash] = entry
+                self._update_access_time(image_hash)
+                keys.append(image_hash)
+                entry_ptrs, entry_sizes = build_transfer_buffers(entry, pool)
+                all_ptrs.append(entry_ptrs)
+                all_sizes.append(entry_sizes)
 
             if not keys:
                 return
 
             logger.info(
-                f"Req {req_id}: Starting global fetch for {len(keys)} images from Mooncake."
+                f"Req {req_id}: Starting global fetch for {len(keys)} "
+                f"embeddings from Mooncake."
             )
 
-            op = EmbeddingPrefetchOperation(req_id, keys, ptrs, sizes)
+            op = EmbeddingPrefetchOperation(req_id, keys, all_ptrs, all_sizes)
             self.ongoing_prefetch[req_id] = op
             self.prefetch_queue.put(op)
 
     def insert_batch(
-        self, image_hashes: List[str], embedding_tensors: List[torch.Tensor]
+        self,
+        image_hashes: List[str],
+        embedding_tensors: List[torch.Tensor],
+        modality: Modality = None,
     ):
         """Issues ONE batch PUT for all embeddings computed by this request.
 
@@ -398,63 +552,123 @@ class EmbeddingCacheController:
         to ensure multi-node cache consistency. Mooncake's batch_put has
         built-in deduplication to avoid redundant transfers.
         """
-        keys, ptrs, sizes = [], [], []
+        pool = self._get_pool(modality)
+        if pool is None:
+            logger.warning(f"insert_batch: unknown modality {modality}; skipping.")
+            return
+
+        keys, all_ptrs, all_sizes = [], [], []
         local_hit_count = 0
         new_count = 0
         skipped_count = 0
 
         with self.lock:
-            for h, tensor in zip(image_hashes, embedding_tensors):
-                if h in self.hash_to_metadata:
-                    # Update access time for existing entry
-                    self._update_access_time(h)
-                    self._protect_hash(h)
-                    # Local cache hit: ensure Mooncake has it
-                    offset, num_tokens, dim, size_bytes = self.hash_to_metadata[h][:4]
-
-                    # Still push to Mooncake for multi-node sharing
-                    # (Mooncake batch_put will deduplicate if already exists)
-                    keys.append(h)
-                    ptrs.append(self.cpu_pool.data_ptr() + offset)
-                    sizes.append(size_bytes)
-                    local_hit_count += 1
-                    continue
-
-                # Local cache miss: allocate and copy
-                num_tokens, dim = tensor.shape[0], tensor.shape[1]
-                size_bytes = num_tokens * dim * self.element_size
-                offset = self._allocate_with_eviction(size_bytes)
-                if offset is None:
-                    logger.warning(
-                        f"Failed to allocate {size_bytes / 1024**2:.2f} MB for insert, "
-                        f"skipping this embedding."
-                    )
+            for image_hash, tensor in zip(image_hashes, embedding_tensors):
+                if tensor.ndim != 2:
+                    tensor = tensor.reshape(-1, tensor.shape[-1])
+                num_tokens, actual_dim = int(tensor.shape[0]), int(tensor.shape[1])
+                # TODO(CYA): check how to reinit
+                if actual_dim != pool.dim and not self._reinit_pool_for_dim(
+                    pool, actual_dim
+                ):
                     skipped_count += 1
                     continue
 
-                # Copy to pinned pool for RDMA
-                target_view = (
-                    self.cpu_pool[offset : offset + size_bytes]
-                    .view(torch.float32)
-                    .view(num_tokens, dim)
-                )
-                target_view.copy_(tensor.cpu())
-                self.hash_to_metadata[h] = (offset, num_tokens, dim, size_bytes)
-                self._update_access_time(h)
-                self._protect_hash(h)
+                entry = self.entries.get(image_hash)
+                if entry is not None:
+                    if entry.state == EntryState.LOADING:
+                        skipped_count += 1
+                        logger.debug(
+                            f"Skipping insert for {image_hash}: GET is in flight."
+                        )
+                        continue
+                    if entry.dim != actual_dim or entry.num_tokens != num_tokens:
+                        if entry.ref_count > 0 or entry.state == EntryState.PUTTING:
+                            skipped_count += 1
+                            continue
+                        self._evict_entry(image_hash)
+                        entry = None
+                    else:
+                        self._update_access_time(image_hash)
+                        if entry.state == EntryState.PUTTING:
+                            local_hit_count += 1
+                            continue
+                        entry.state = EntryState.PUTTING
+                        keys.append(image_hash)
+                        entry_ptrs, entry_sizes = build_transfer_buffers(entry, pool)
+                        all_ptrs.append(entry_ptrs)
+                        all_sizes.append(entry_sizes)
+                        local_hit_count += 1
+                        continue
 
-                keys.append(h)
-                ptrs.append(self.cpu_pool.data_ptr() + offset)
-                sizes.append(size_bytes)
-                new_count += 1
+                if entry is None:
+                    page_ids = self._allocate_with_eviction(pool, num_tokens)
+                    if page_ids is None:
+                        logger.warning(
+                            f"Failed to allocate {num_tokens} tokens in "
+                            f"{pool.modality} pool for insert; skipping."
+                        )
+                        skipped_count += 1
+                        continue
+
+                    entry = EmbeddingCacheEntry(
+                        hash=image_hash,
+                        modality=modality,
+                        num_tokens=num_tokens,
+                        dim=actual_dim,
+                        page_ids=page_ids,
+                        state=EntryState.PUTTING,
+                        ref_count=0,
+                    )
+                    self._copy_tensor_to_pages(tensor, entry, pool)
+                    self.entries[image_hash] = entry
+                    self._update_access_time(image_hash)
+                    keys.append(image_hash)
+                    entry_ptrs, entry_sizes = build_transfer_buffers(entry, pool)
+                    all_ptrs.append(entry_ptrs)
+                    all_sizes.append(entry_sizes)
+                    new_count += 1
 
             if keys:
                 logger.info(
-                    f"Global Cache: Inserting {len(keys)} embeddings into Mooncake cluster "
-                    f"({new_count} new, {local_hit_count} existing for replication, "
-                    f"{skipped_count} skipped due to allocation failure)"
+                    f"Global Cache: Inserting {len(keys)} embeddings into "
+                    f"Mooncake cluster ({new_count} new, {local_hit_count} existing, "
+                    f"{skipped_count} skipped)"
                 )
-                self.insert_queue.put(EmbeddingInsertOperation(keys, ptrs, sizes))
+                self.insert_queue.put(
+                    EmbeddingInsertOperation(keys, all_ptrs, all_sizes)
+                )
+
+    def _finish_get(self, op: EmbeddingPrefetchOperation, results: List[bool]):
+        with self.lock:
+            for image_hash, success in zip(op.keys, results):
+                entry = self.entries.get(image_hash)
+                if entry is None:
+                    continue
+                if success:
+                    if entry.state == EntryState.LOADING:
+                        entry.state = EntryState.EVICTABLE
+                else:
+                    pool = self._get_pool(entry.modality)
+                    pool.allocator.free(entry.page_ids)
+                    del self.entries[image_hash]
+                    with self.access_lock:
+                        self.access_order.pop(image_hash, None)
+        op.mark_done(all(results))
+
+    def _finish_put(self, op: EmbeddingInsertOperation, results: List[bool]):
+        with self.lock:
+            for image_hash, success in zip(op.keys, results):
+                entry = self.entries.get(image_hash)
+                if entry is None:
+                    continue
+                if not success:
+                    logger.warning(
+                        f"[Rank {self.tp_rank}] Mooncake PUT failed for "
+                        f"{image_hash}; keeping local cache entry."
+                    )
+                if entry.state == EntryState.PUTTING:
+                    entry.state = EntryState.EVICTABLE
 
     def _io_loop(self):
         """Asynchronous worker handling both Batch GET and Batch PUT."""
@@ -463,16 +677,19 @@ class EmbeddingCacheController:
 
             try:
                 op = self.prefetch_queue.get_nowait()
-                results = self.mooncake_store.batch_get(op.keys, op.ptrs, op.sizes)
+                try:
+                    results = self.mooncake_store.batch_get_into_multi_buffers(
+                        op.keys, op.ptrs, op.sizes
+                    )
+                except Exception:
+                    logger.exception("Mooncake multi-buffer GET failed")
+                    results = [False] * len(op.keys)
                 success_count = sum(results)
                 logger.info(
-                    f"Mooncake GET Finished: Req {op.req_id}, Successfully fetched {success_count}/{len(op.keys)} images."
+                    f"Mooncake GET Finished: Req {op.req_id}, "
+                    f"Successfully fetched {success_count}/{len(op.keys)} embeddings."
                 )
-                op.mark_done(all(results))
-                # Release ref counts now that RDMA GET is complete
-                with self.lock:
-                    for h in op.keys:
-                        self._release_hash(h)
+                self._finish_get(op, results)
                 self.prefetch_queue.task_done()
                 processed_any = True
             except Empty:
@@ -480,14 +697,18 @@ class EmbeddingCacheController:
 
             try:
                 op = self.insert_queue.get_nowait()
-                self.mooncake_store.batch_put(op.keys, op.ptrs, op.sizes)
+                try:
+                    results = self.mooncake_store.batch_put_from_multi_buffers(
+                        op.keys, op.ptrs, op.sizes
+                    )
+                except Exception:
+                    logger.exception("Mooncake multi-buffer PUT failed")
+                    results = [False] * len(op.keys)
+                self._finish_put(op, results)
                 logger.info(
-                    f"Mooncake PUT Finished: Successfully stored {len(op.keys)} keys in cluster."
+                    f"Mooncake PUT Finished: Stored {sum(results)}/{len(op.keys)} "
+                    f"embeddings in cluster."
                 )
-                # Release ref counts now that RDMA PUT is complete
-                with self.lock:
-                    for h in op.keys:
-                        self._release_hash(h)
                 self.insert_queue.task_done()
                 processed_any = True
             except Empty:
@@ -505,7 +726,7 @@ class EmbeddingCacheController:
             else:
                 op = self.ongoing_prefetch[req_id]
                 if op.is_finished:
-                    local_ready = op.success
+                    local_ready = True
 
         if self.all_rank_get and self.tp_world_size > 1:
             ready_tensor = torch.tensor(
@@ -524,58 +745,170 @@ class EmbeddingCacheController:
             return True
         return False
 
-    def get_embeddings(self, image_hashes: List[str]) -> List[torch.Tensor]:
-        """Final reconstruction for model input.
-
-        Returns views into the pinned cpu_pool.  Callers MUST call
-        release_embeddings() once they no longer need the returned
-        tensors (e.g. after .to(device) or torch.cat) so that the
-        entries can be evicted.
-        """
+    def copy_embedding_to(
+        self, image_hash: str, dst_tensor: torch.Tensor, dst_token_offset: int
+    ) -> bool:
+        # Pin the entry to prevent eviction during copy (including async DMA).
         with self.lock:
-            tensors = []
-            for h in image_hashes:
-                if h not in self.hash_to_metadata:
-                    logger.warning(f"Hash {h} not found in local cache")
-                    tensors.append(None)
-                    continue
-                # Update access time for LRU
-                self._update_access_time(h)
-                self._protect_hash(h)
-                offset, num_tokens, dim, size_bytes = self.hash_to_metadata[h][:4]
-                tensors.append(
-                    self.cpu_pool[offset : offset + size_bytes]
-                    .view(torch.float32)
-                    .view(num_tokens, dim)
+            entry = self.entries.get(image_hash)
+            if entry is None:
+                logger.warning(f"Hash {image_hash} not found in local cache")
+                return False
+            if entry.state not in (EntryState.EVICTABLE, EntryState.PUTTING):
+                logger.warning(
+                    f"Hash {image_hash} is not ready; state={entry.state.name}"
                 )
-            return tensors
+                return False
+            entry.ref_count += 1
+            self._update_access_time(image_hash)
 
-    def release_embeddings(self, image_hashes: List[str]):
-        """Release reference counts on embeddings after the caller is done.
+        try:
+            pool = self._get_pool(entry.modality)
+            self._copy_entry_to_tensor(entry, dst_tensor, dst_token_offset)
+            # Wait for non-blocking H2D copy to finish before unpinning,
+            # so the source pages are not reused while DMA is in flight.
+            if dst_tensor.device.type == "cuda":
+                torch.cuda.current_stream(dst_tensor.device).synchronize()
+            return True
+        finally:
+            with self.lock:
+                entry.ref_count -= 1
 
-        Must be called once for every successful get_embeddings() call,
-        after the caller no longer needs the returned tensor views
-        (e.g. after .to(device) or torch.cat has copied the data).
-        """
+    def has_local_embedding(self, image_hash: str) -> bool:
         with self.lock:
-            for h in image_hashes:
-                self._release_hash(h)
+            entry = self.entries.get(image_hash)
+            return entry is not None and entry.state in (
+                EntryState.EVICTABLE,
+                EntryState.PUTTING,
+            )
+
+    def store_to_pool(
+        self,
+        image_hashes: List[str],
+        tensors: List[torch.Tensor],
+        modality=None,
+    ) -> List[bool]:
+        """Store GPU/CPU tensors into host paged pool with blocking copy.
+
+        Allocates pages and performs synchronous device-to-host copy.
+        Does NOT initiate storage PUT. Entries are marked EVICTABLE so
+        that subsequent insert_batch() can reuse them for async PUT.
+
+        Returns: per-item success (False if page allocation failed).
+        """
+        pool = self._get_pool(modality)
+        if pool is None:
+            return [False] * len(image_hashes)
+
+        results = []
+        with self.lock:
+            for image_hash, tensor in zip(image_hashes, tensors):
+                if tensor.ndim != 2:
+                    tensor = tensor.reshape(-1, tensor.shape[-1])
+                num_tokens, actual_dim = int(tensor.shape[0]), int(tensor.shape[1])
+
+                if actual_dim != pool.dim and not self._reinit_pool_for_dim(
+                    pool, actual_dim
+                ):
+                    results.append(False)
+                    continue
+
+                entry = self.entries.get(image_hash)
+                if entry is not None:
+                    if entry.state in (EntryState.EVICTABLE, EntryState.PUTTING):
+                        self._update_access_time(image_hash)
+                        results.append(True)
+                        continue
+                    if entry.state == EntryState.LOADING:
+                        results.append(False)
+                        continue
+                    self._evict_entry(image_hash)
+
+                page_ids = self._allocate_with_eviction(pool, num_tokens)
+                if page_ids is None:
+                    results.append(False)
+                    continue
+
+                entry = EmbeddingCacheEntry(
+                    hash=image_hash,
+                    modality=modality,
+                    num_tokens=num_tokens,
+                    dim=actual_dim,
+                    page_ids=page_ids,
+                    state=EntryState.EVICTABLE,
+                    ref_count=0,
+                )
+                self._copy_tensor_to_pool_sync(tensor, entry, pool)
+                self.entries[image_hash] = entry
+                self._update_access_time(image_hash)
+                results.append(True)
+        return results
+
+    def _copy_tensor_to_pool_sync(
+        self, tensor: torch.Tensor, entry: EmbeddingCacheEntry, pool: EmbeddingPool
+    ):
+        """Blocking copy from device/host tensor to pinned pool pages."""
+        src = tensor.detach()
+        if src.ndim != 2:
+            src = src.reshape(-1, src.shape[-1])
+        if not src.is_contiguous():
+            src = src.contiguous()
+
+        needs_sync = src.device.type == "cuda"
+        copied = 0
+        for page_id in entry.page_ids:
+            valid_tokens = min(pool.page_size_tokens, entry.num_tokens - copied)
+            if valid_tokens <= 0:
+                break
+            start = page_id * pool.page_size_tokens
+            pool.tensor[start : start + valid_tokens].copy_(
+                src[copied : copied + valid_tokens]
+            )
+            copied += valid_tokens
+
+        if needs_sync:
+            torch.cuda.current_stream(src.device).synchronize()
+
+    def get_embedding_dim(self, modality=None) -> int:
+        return self._get_pool(modality).dim
 
     def get_stats(self) -> dict:
         """Return cache statistics."""
         with self.lock:
+            allocated_bytes = sum(
+                len(entry.page_ids) * self._get_pool(entry.modality).page_bytes
+                for entry in self.entries.values()
+            )
+            free_bytes = sum(
+                pool.allocator.free_pages * pool.page_bytes
+                for pool in self.pools.values()
+            )
             return {
                 **self.stats,
-                "num_cached": len(self.hash_to_metadata),
-                "num_protected": sum(1 for v in self.ref_counts.values() if v > 0),
-                "allocated_mb": self.allocator.get_allocated_size() / 1024**2,
-                "free_mb": self.allocator.get_free_size() / 1024**2,
-                "total_mb": self.total_pool_size_bytes / 1024**2,
+                "num_cached": len(self.entries),
+                "num_protected": sum(
+                    1 for entry in self.entries.values() if entry.ref_count > 0
+                ),
+                "allocated_mb": allocated_bytes / 1024**2,
+                "free_mb": free_bytes / 1024**2,
+                "total_mb": sum(
+                    pool.num_pages * pool.page_bytes for pool in self.pools.values()
+                )
+                / 1024**2,
+                "vision_free_pages": self.vision_pool.allocator.free_pages,
+                "audio_free_pages": self.audio_pool.allocator.free_pages,
             }
 
     async def batch_is_exist(self, image_hashes: List[str]) -> List[bool]:
         with self.lock:
-            local_results = [h in self.hash_to_metadata for h in image_hashes]
+            # TODO(cya): check it，正在load的算不算命中
+            local_results = [
+                (
+                    (entry := self.entries.get(h)) is not None
+                    and entry.state in (EntryState.EVICTABLE, EntryState.PUTTING)
+                )
+                for h in image_hashes
+            ]
         local_hit_count = sum(local_results)
 
         global_hit_count = 0
